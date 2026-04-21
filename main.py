@@ -1,8 +1,12 @@
 import asyncio
 import csv
 import json
+import logging
 import os
 from pathlib import Path
+
+logging.basicConfig(level=logging.INFO)
+log = logging.getLogger("gtc")
 
 import httpx
 from fastapi import FastAPI
@@ -87,7 +91,12 @@ async def get_places() -> list:
             return _places_cache
 
         places_data = os.environ.get("PLACES_DATA")
+        log.info("PLACES_FILE exists: %s", PLACES_FILE.exists())
+        log.info("PLACES_DATA env var present: %s, length: %s",
+                 bool(places_data), len(places_data) if places_data else 0)
+
         if not PLACES_FILE.exists() and not places_data:
+            log.warning("No places source found — returning empty list")
             _places_cache = []
             return []
 
@@ -97,9 +106,12 @@ async def get_places() -> list:
         import io
         raw = (PLACES_FILE.read_text(encoding="utf-8") if PLACES_FILE.exists()
                else places_data)
+        log.info("Raw data first 200 chars: %r", raw[:200])
         reader = csv.DictReader(io.StringIO(raw.strip()))
         for row in reader:
             rows.append({k.strip(): (v.strip() if v else '') for k, v in row.items() if k})
+
+        log.info("Parsed %d rows: %s", len(rows), [r.get("name") for r in rows])
 
         needs_save = False
 
@@ -116,29 +128,36 @@ async def get_places() -> list:
 
                 address = row.get("address", "")
                 if not address:
+                    log.warning("Row with no address: %s", row)
                     continue
 
                 if address in geo_cache:
                     row["lat"] = geo_cache[address]["lat"]
                     row["lng"] = geo_cache[address]["lng"]
+                    log.info("Cache hit: %s", row.get("name"))
                 else:
                     # Nominatim rate-limit: 1 req/s
                     await asyncio.sleep(1.2)
                     coords = await _geocode(address, client)
                     if not coords and row.get("gmaps_url"):
+                        log.info("Nominatim failed for %s, trying gmaps", row.get("name"))
                         coords = await _coords_from_gmaps(row["gmaps_url"], client)
                     if coords:
                         row["lat"], row["lng"] = coords
                         geo_cache[address] = {"lat": coords[0], "lng": coords[1]}
                         needs_save = True
                     else:
+                        log.warning("Geocode failed for %s (%s)", row.get("name"), address)
                         row["geocode_failed"] = True
 
         if needs_save:
             _save_geo_cache(geo_cache)
 
-        # Keep all rows — failed ones carry geocode_failed=True, no lat/lng
-        # Only geocoded rows participate in the travel matrix (filtered there)
+        ok  = [r["name"] for r in rows if "lat" in r]
+        bad = [r["name"] for r in rows if r.get("geocode_failed")]
+        log.info("Geocoded OK: %s", ok)
+        log.info("Geocode failed: %s", bad)
+
         _places_cache = rows
         return _places_cache
 
