@@ -104,12 +104,16 @@ async def get_places() -> list:
         rows: list[dict] = []
 
         import io
-        raw = (PLACES_FILE.read_text(encoding="utf-8") if PLACES_FILE.exists()
-               else places_data)
-        log.info("Raw data first 200 chars: %r", raw[:200])
-        reader = csv.DictReader(io.StringIO(raw.strip()))
-        for row in reader:
-            rows.append({k.strip(): (v.strip() if v else '') for k, v in row.items() if k})
+        if PLACES_FILE.exists():
+            raw = PLACES_FILE.read_text(encoding="utf-8")
+            log.info("Reading from file, first 200 chars: %r", raw[:200])
+            reader = csv.DictReader(io.StringIO(raw.strip()))
+            for row in reader:
+                rows.append({k.strip(): (v.strip() if v else '') for k, v in row.items() if k})
+        else:
+            log.info("Reading from PLACES_DATA env var, first 200 chars: %r", places_data[:200])
+            # Env var is JSON to avoid CSV quoting issues with commas in values
+            rows = json.loads(places_data)
 
         log.info("Parsed %d rows: %s", len(rows), [r.get("name") for r in rows])
 
