@@ -1,28 +1,44 @@
-[![Deploy with Vercel](https://vercel.com/button)](https://vercel.com/new/clone?repository-url=https%3A%2F%2Fgithub.com%2Fvercel%2Fexamples%2Ftree%2Fmain%2Fpython%2Ffastapi&demo-title=FastAPI&demo-description=Use%20FastAPI%20on%20Vercel%20with%20Serverless%20Functions%20using%20the%20Python%20Runtime.&demo-url=https%3A%2F%2Fvercel-plus-fastapi.vercel.app%2F&demo-image=https://assets.vercel.com/image/upload/v1669994600/random/python.png)
+# Going to California
 
-# FastAPI + Vercel
+An interactive travel-planning map. Add locations to a CSV, see driving times between all of them, and draw the actual route between any two.
 
-This example shows how to use FastAPI on Vercel with Serverless Functions using the [Python Runtime](https://vercel.com/docs/concepts/functions/serverless-functions/runtimes/python).
+## Features
 
-## Demo
-
-https://vercel-plus-fastapi.vercel.app/
-
-## How it Works
-
-This example uses the Asynchronous Server Gateway Interface (ASGI) with FastAPI to enable handling requests on Vercel with Serverless Functions.
+- Dark full-screen map (CartoDB Dark Matter + Leaflet)
+- Loads places from `places.csv` (gitignored) or a `PLACES_DATA` environment variable
+- Geocodes addresses via Nominatim, with Google Maps URL as fallback
+- Fetches a full driving-time matrix from OSRM on startup — no API keys required
+- Click a location → see driving times to all others, sorted and ranked
+- Click a second location → draws the actual road route with duration and distance
+- Failed geocodes shown with a warning, excluded from routing
+- Geocoded coordinates cached locally to avoid repeat lookups
 
 ## Running Locally
 
 ```bash
-npm i -g vercel
-vercel dev
+uv sync
+uv run fastapi dev main.py
 ```
 
-Your FastAPI application is now available at `http://localhost:3000`.
+Open http://localhost:8000.
 
-## One-Click Deploy
+### Places file
 
-Deploy the example using [Vercel](https://vercel.com?utm_source=github&utm_medium=readme&utm_campaign=vercel-examples):
+Create `places.csv` in the project root (it's gitignored):
 
-[![Deploy with Vercel](https://vercel.com/button)](https://vercel.com/new/clone?repository-url=https%3A%2F%2Fgithub.com%2Fvercel%2Fexamples%2Ftree%2Fmain%2Fpython%2Ffastapi&demo-title=FastAPI&demo-description=Use%20FastAPI%20on%20Vercel%20with%20Serverless%20Functions%20using%20the%20Python%20Runtime.&demo-url=https%3A%2F%2Fvercel-plus-fastapi.vercel.app%2F&demo-image=https://assets.vercel.com/image/upload/v1669994600/random/python.png)
+```csv
+name,address,gmaps_url
+Marina Del Rey,4148 Via Marina Marina Del Rey CA 90292,https://maps.app.goo.gl/...
+Yosemite,7229 Yosemite Park Way Yosemite West CA 95389,
+```
+
+- `gmaps_url` is optional but used as a geocoding fallback if Nominatim can't resolve the address
+- You can also add `lat` and `lng` columns to skip geocoding entirely
+
+## Deploying to Vercel
+
+Set the `PLACES_DATA` environment variable in Vercel (Settings → Environment Variables) to the full contents of your `places.csv`. The app will read from it when the file isn't present on the server.
+
+```
+uv run vercel --prod
+```
