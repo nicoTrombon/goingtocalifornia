@@ -86,14 +86,18 @@ async def get_places() -> list:
         if _places_cache is not None:
             return _places_cache
 
-        if not PLACES_FILE.exists():
+        places_data = os.environ.get("PLACES_DATA")
+        if not PLACES_FILE.exists() and not places_data:
             _places_cache = []
             return []
 
         geo_cache = _load_geo_cache()
         rows: list[dict] = []
 
-        with open(PLACES_FILE, encoding="utf-8") as f:
+        import io
+        f = (open(PLACES_FILE, encoding="utf-8") if PLACES_FILE.exists()
+             else io.StringIO(places_data))
+        with f:
             reader = csv.DictReader(f)
             for row in reader:
                 rows.append({k.strip(): v.strip() for k, v in row.items() if k})
