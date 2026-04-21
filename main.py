@@ -95,12 +95,11 @@ async def get_places() -> list:
         rows: list[dict] = []
 
         import io
-        f = (open(PLACES_FILE, encoding="utf-8") if PLACES_FILE.exists()
-             else io.StringIO(places_data))
-        with f:
-            reader = csv.DictReader(f)
-            for row in reader:
-                rows.append({k.strip(): v.strip() for k, v in row.items() if k})
+        raw = (PLACES_FILE.read_text(encoding="utf-8") if PLACES_FILE.exists()
+               else places_data)
+        reader = csv.DictReader(io.StringIO(raw.strip()))
+        for row in reader:
+            rows.append({k.strip(): (v.strip() if v else '') for k, v in row.items() if k})
 
         needs_save = False
 
