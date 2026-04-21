@@ -907,7 +907,10 @@ function renderSidebar(routeData = null) {
 function pick(idx) {
   if (places[idx]?.geocode_failed) return;
 
-  if (originIdx === null) {
+  if (destIdx !== null) {
+    // Route active → any click resets
+    reset();
+  } else if (originIdx === null) {
     // Nothing selected → set origin
     originIdx = idx;
     renderMarkers();
@@ -917,14 +920,6 @@ function pick(idx) {
   } else if (idx === originIdx) {
     // Click origin again → full reset
     reset();
-  } else if (idx === destIdx) {
-    // Click dest again → deselect dest, back to overview
-    destIdx = null;
-    clearRoute();
-    renderMarkers();
-    renderSidebar();
-    drawOverviewLines();
-    setStatus(`Driving times from ${places[originIdx].name} — click another to route`);
   } else {
     // Different place → set as destination, show route
     destIdx = idx;
