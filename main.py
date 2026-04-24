@@ -630,6 +630,14 @@ HTML = r"""<!DOCTYPE html>
       padding: 2px 5px; border-radius: 4px;
       color: var(--amber);
     }
+
+    .maps-link {
+      display: inline-flex; align-items: center; gap: 3px;
+      font-size: 10px; color: var(--text-lo); text-decoration: none;
+      margin-bottom: 6px;
+      transition: color 0.15s;
+    }
+    .maps-link:hover { color: var(--amber); }
   </style>
 </head>
 <body>
@@ -859,6 +867,7 @@ function renderSidebar(routeData = null) {
           <span class="warn-badge">⚠ Not found</span>
         </div>
         <div class="place-addr">${esc(p.address)}</div>
+        ${p.gmaps_url ? `<a class="maps-link" href="${esc(p.gmaps_url)}" target="_blank" rel="noopener" onclick="event.stopPropagation()">↗ Open in Maps</a>` : ''}
         <div class="place-travel"><span style="font-size:11px;color:var(--text-lo)">Could not geocode address</span></div>
       </div>`;
     }
@@ -897,6 +906,7 @@ function renderSidebar(routeData = null) {
         ${rankHtml}
       </div>
       <div class="place-addr">${esc(p.address)}</div>
+      ${p.gmaps_url ? `<a class="maps-link" href="${esc(p.gmaps_url)}" target="_blank" rel="noopener" onclick="event.stopPropagation()">↗ Open in Maps</a>` : ''}
       ${travelHtml}
     </div>`;
   }).join('');
