@@ -1,8 +1,10 @@
 import asyncio
 import csv
+import hashlib
 import json
 import logging
 import os
+import time
 from pathlib import Path
 
 logging.basicConfig(level=logging.INFO)
@@ -14,18 +16,24 @@ from fastapi.responses import HTMLResponse
 
 BASE_DIR = Path(__file__).parent
 PLACES_FILE = BASE_DIR / "places.csv"
-# Cache geocoded coords locally; keep out of git via .gitignore
 CACHE_FILE = (
     Path("/tmp/places_cache.json")
     if os.environ.get("VERCEL")
     else BASE_DIR / "places_cache.json"
 )
 
+BLOB_TOKEN = os.environ.get("BLOB_READ_WRITE_TOKEN")
+BLOB_TTL = 7 * 24 * 3600  # 7 days
+
 _places_cache: list | None = None
 _places_lock = asyncio.Lock()
+_matrix_cache: dict | None = None
+_routes_cache: dict = {}
+_blob_filename: str | None = None
+_geocoded_at: float | None = None
 
 
-# ── Geocoding ────────────────────────────────────────────────────────────────
+# ── Geo coord cache (local file) ──────────────────────────────────────────────
 
 def _load_geo_cache() -> dict:
     if CACHE_FILE.exists():
@@ -42,6 +50,68 @@ def _save_geo_cache(cache: dict) -> None:
     except Exception:
         pass
 
+
+# ── Blob cache (Vercel Blob, 7-day TTL) ──────────────────────────────────────
+
+async def _blob_read(client: httpx.AsyncClient, prefix: str) -> dict | None:
+    if not BLOB_TOKEN:
+        return None
+    try:
+        r = await client.get(
+            "https://blob.vercel-storage.com",
+            params={"prefix": prefix, "limit": 1},
+            headers={"Authorization": f"Bearer {BLOB_TOKEN}"},
+            timeout=8,
+        )
+        blobs = r.json().get("blobs", [])
+        if not blobs:
+            return None
+        data = (await client.get(blobs[0]["url"], timeout=8)).json()
+        if time.time() - data.get("geocoded_at", 0) > BLOB_TTL:
+            log.info("Blob cache expired")
+            return None
+        log.info("Blob cache hit: %s", blobs[0]["pathname"])
+        return data
+    except Exception as e:
+        log.warning("Blob read error: %s", e)
+        return None
+
+
+async def _blob_write(filename: str, geocoded_at: float, places: list,
+                      matrix: dict, routes: dict) -> None:
+    if not BLOB_TOKEN:
+        return
+    try:
+        payload = json.dumps({
+            "geocoded_at": geocoded_at,
+            "places": places,
+            "matrix": matrix,
+            "routes": routes,
+        }).encode()
+        async with httpx.AsyncClient() as client:
+            await client.put(
+                f"https://blob.vercel-storage.com/{filename}",
+                content=payload,
+                headers={
+                    "Authorization": f"Bearer {BLOB_TOKEN}",
+                    "content-type": "application/json",
+                    "x-vercel-blob-access": "public",
+                },
+                timeout=15,
+            )
+        log.info("Blob cache written: %s", filename)
+    except Exception as e:
+        log.warning("Blob write error: %s", e)
+
+
+def _schedule_blob_write() -> None:
+    if _blob_filename and _places_cache is not None and _matrix_cache is not None and _geocoded_at:
+        asyncio.create_task(_blob_write(
+            _blob_filename, _geocoded_at, _places_cache, _matrix_cache, dict(_routes_cache)
+        ))
+
+
+# ── Geocoding ────────────────────────────────────────────────────────────────
 
 async def _coords_from_gmaps(url: str, client: httpx.AsyncClient) -> tuple[float, float] | None:
     """Follow a Google Maps short URL and extract coordinates from the final URL."""
@@ -82,7 +152,7 @@ async def _geocode(address: str, client: httpx.AsyncClient) -> tuple[float, floa
 # ── Places loading ────────────────────────────────────────────────────────────
 
 async def get_places() -> list:
-    global _places_cache
+    global _places_cache, _matrix_cache, _blob_filename, _geocoded_at
     if _places_cache is not None:
         return _places_cache
 
@@ -100,28 +170,44 @@ async def get_places() -> list:
             _places_cache = []
             return []
 
-        geo_cache = _load_geo_cache()
-        rows: list[dict] = []
-
         import io
         if PLACES_FILE.exists():
             raw = PLACES_FILE.read_text(encoding="utf-8")
             log.info("Reading from file, first 200 chars: %r", raw[:200])
-            reader = csv.DictReader(io.StringIO(raw.strip()))
-            for row in reader:
-                rows.append({k.strip(): (v.strip() if v else '') for k, v in row.items() if k})
         else:
-            log.info("Reading from PLACES_DATA env var, first 200 chars: %r", places_data[:200])
-            # Env var is JSON to avoid CSV quoting issues with commas in values
-            rows = json.loads(places_data)
+            raw = places_data
+            log.info("Reading from PLACES_DATA env var, first 200 chars: %r", raw[:200])
+
+        places_hash = hashlib.sha256(raw.encode()).hexdigest()[:12]
+        _blob_filename = f"gtc-{places_hash}.json"
+
+        # Try blob cache before geocoding
+        async with httpx.AsyncClient() as client:
+            cached = await _blob_read(client, f"gtc-{places_hash}")
+        if cached:
+            _places_cache = cached["places"]
+            _matrix_cache = cached.get("matrix")
+            _routes_cache.update(cached.get("routes", {}))
+            _geocoded_at = cached.get("geocoded_at", time.time())
+            log.info("Loaded from blob: %d places, %d cached routes",
+                     len(_places_cache), len(_routes_cache))
+            return _places_cache
+
+        # Blob miss — parse and geocode
+        if PLACES_FILE.exists():
+            reader = csv.DictReader(io.StringIO(raw.strip()))
+            rows = [{k.strip(): (v.strip() if v else '') for k, v in row.items() if k}
+                    for row in reader]
+        else:
+            rows = json.loads(raw)
 
         log.info("Parsed %d rows: %s", len(rows), [r.get("name") for r in rows])
 
+        geo_cache = _load_geo_cache()
         needs_save = False
 
         async with httpx.AsyncClient() as client:
             for row in rows:
-                # Accept pre-supplied lat/lng in the CSV
                 try:
                     if row.get("lat") and row.get("lng"):
                         row["lat"] = float(row["lat"])
@@ -163,20 +249,25 @@ async def get_places() -> list:
         log.info("Geocode failed: %s", bad)
 
         _places_cache = rows
+        _geocoded_at = time.time()
         return _places_cache
 
 
 # ── Travel matrix (OSRM) ──────────────────────────────────────────────────────
 
 async def get_travel_matrix(places: list) -> dict:
+    global _matrix_cache
+    if _matrix_cache is not None:
+        return _matrix_cache
+
     n = len(places)
     null_row = [None] * n
     empty = {"durations": [null_row[:] for _ in range(n)],
              "distances": [null_row[:] for _ in range(n)]}
 
-    # Only route between successfully geocoded places; track their original indices
     routable_idx = [i for i, p in enumerate(places) if not p.get("geocode_failed")]
     if len(routable_idx) < 2:
+        _matrix_cache = empty
         return empty
 
     coords = ";".join(f"{places[i]['lng']},{places[i]['lat']}" for i in routable_idx)
@@ -189,23 +280,31 @@ async def get_travel_matrix(places: list) -> dict:
             if data.get("code") == "Ok":
                 osrm_dur  = data.get("durations", [])
                 osrm_dist = data.get("distances", [])
-                # Expand back to full N×N matrix (null for failed places)
                 full_dur  = [null_row[:] for _ in range(n)]
                 full_dist = [null_row[:] for _ in range(n)]
                 for ri, i in enumerate(routable_idx):
                     for rj, j in enumerate(routable_idx):
                         full_dur[i][j]  = osrm_dur[ri][rj]
                         full_dist[i][j] = osrm_dist[ri][rj]
-                return {"durations": full_dur, "distances": full_dist}
+                result = {"durations": full_dur, "distances": full_dist}
+                _matrix_cache = result
+                _schedule_blob_write()
+                return result
     except Exception:
         pass
 
+    _matrix_cache = empty
     return empty
 
 
 # ── Route geometry (OSRM) ─────────────────────────────────────────────────────
 
-async def get_route(origin: dict, dest: dict) -> dict | None:
+async def get_route(origin: dict, dest: dict, from_idx: int = -1, to_idx: int = -1) -> dict | None:
+    key = f"{from_idx}:{to_idx}"
+    if from_idx >= 0 and key in _routes_cache:
+        log.info("Route cache hit: %s -> %s", from_idx, to_idx)
+        return _routes_cache[key]
+
     url = (f"http://router.project-osrm.org/route/v1/driving/"
            f"{origin['lng']},{origin['lat']};{dest['lng']},{dest['lat']}")
     try:
@@ -214,11 +313,15 @@ async def get_route(origin: dict, dest: dict) -> dict | None:
             data = r.json()
             if data.get("code") == "Ok":
                 route = data["routes"][0]
-                return {
+                result = {
                     "duration": route["duration"],
                     "distance": route["distance"],
                     "geometry": route["geometry"],
                 }
+                if from_idx >= 0:
+                    _routes_cache[key] = result
+                    _schedule_blob_write()
+                return result
     except Exception:
         pass
     return None
@@ -245,7 +348,7 @@ async def api_route(from_idx: int, to_idx: int):
     places = await get_places()
     if from_idx >= len(places) or to_idx >= len(places):
         return {"error": "Invalid index"}
-    result = await get_route(places[from_idx], places[to_idx])
+    result = await get_route(places[from_idx], places[to_idx], from_idx, to_idx)
     return result or {"error": "Route not found"}
 
 
