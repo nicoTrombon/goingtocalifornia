@@ -288,7 +288,8 @@ async def get_travel_matrix(places: list) -> dict:
                         full_dist[i][j] = osrm_dist[ri][rj]
                 result = {"durations": full_dur, "distances": full_dist}
                 _matrix_cache = result
-                _schedule_blob_write()
+                await _blob_write(_blob_filename, _geocoded_at, _places_cache,
+                                  _matrix_cache, dict(_routes_cache))
                 return result
     except Exception:
         pass
