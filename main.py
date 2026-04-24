@@ -742,6 +742,41 @@ HTML = r"""<!DOCTYPE html>
       transition: color 0.15s;
     }
     .maps-link:hover { color: var(--amber); }
+
+    /* ── Intermediate stop marker ── */
+    .mkr.inter .mkr-core {
+      background: #94a3b8;
+      box-shadow: 0 0 6px rgba(148,163,184,0.4);
+    }
+
+    /* ── Intermediate stop card accent ── */
+    .place-card.inter-active {
+      background: rgba(148,163,184,0.06);
+      border-color: rgba(148,163,184,0.28);
+    }
+    .place-card.inter-active:hover { border-color: rgba(148,163,184,0.4); }
+    .card-bar.inter-bar { background: linear-gradient(180deg, #94a3b8, #cbd5e1); }
+    .chip.inter-chip {
+      background: rgba(148,163,184,0.12);
+      border: 1px solid rgba(148,163,184,0.28);
+      color: #94a3b8;
+    }
+
+    /* ── Multi-stop route card ── */
+    .route-stops-list { display: flex; flex-direction: column; margin-bottom: 10px; }
+    .route-stop { display: flex; align-items: center; gap: 8px; font-size: 12.5px; font-weight: 600; color: var(--text-hi); }
+    .inter-dot { background: #94a3b8; box-shadow: 0 0 4px rgba(148,163,184,0.5); }
+    .route-leg-row {
+      display: flex; align-items: center; gap: 8px;
+      padding: 2px 0; margin-left: 3px;
+    }
+    .leg-vert-line { width: 1px; height: 16px; background: rgba(255,255,255,0.1); flex-shrink: 0; }
+    .leg-label { font-size: 11px; color: var(--text-mid); }
+    .route-total {
+      font-size: 12.5px; font-weight: 700; color: var(--text-hi);
+      margin-bottom: 10px; padding-top: 8px;
+      border-top: 1px solid var(--border);
+    }
   </style>
 </head>
 <body>
@@ -783,27 +818,30 @@ L.tileLayer('https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png', {
 }).addTo(map);
 
 L.control.zoom({ position: 'bottomright' }).addTo(map);
+map.on('click', () => { if (stops.length) reset(); });
 
 // ── State ───────────────────────────────────────────────────────────────────
-let places    = [];
-let matrix    = { durations: [], distances: [] };
-let markers   = [];
-let lines     = [];
-let routeLayer = null;
-let originIdx  = null;
-let destIdx    = null;
+let places      = [];
+let matrix      = { durations: [], distances: [] };
+let markers     = [];
+let lines       = [];        // overview dashed lines
+let stops       = [];        // ordered list of place indices
+let routeLayers = [];        // one layer per leg
+let legData     = [];        // [{duration, distance, geometry}, ...] per leg
 
 // ── Marker icons ─────────────────────────────────────────────────────────────
 function mkIcon(role) {
-  // role: 'origin' | 'dest' | 'normal'
+  // role: 'origin' | 'dest' | 'inter' | 'normal'
   const isOrigin = role === 'origin';
   const isDest   = role === 'dest';
+  const isInter  = role === 'inter';
   const isActive = isOrigin || isDest;
   const sz = isActive ? 50 : 24;
-  const cls = isOrigin ? 'mkr sel' : isDest ? 'mkr dest' : 'mkr';
+  const cls = isOrigin ? 'mkr sel' : isDest ? 'mkr dest' : isInter ? 'mkr inter' : 'mkr';
+  const ringSize = isActive ? 15 : 11;
   return L.divIcon({
     html: `<div class="${cls}" style="width:${sz}px;height:${sz}px">
-             <div class="mkr-ring" style="width:15px;height:15px"></div>
+             <div class="mkr-ring" style="width:${ringSize}px;height:${ringSize}px"></div>
              <div class="mkr-core"></div>
            </div>`,
     className: '',
@@ -817,7 +855,11 @@ function renderMarkers() {
   markers.forEach(m => m && m.remove());
   markers = places.map((p, i) => {
     if (p.geocode_failed) return null;
-    const role = i === originIdx ? 'origin' : i === destIdx ? 'dest' : 'normal';
+    const pos = stops.indexOf(i);
+    let role = 'normal';
+    if (pos === 0) role = 'origin';
+    else if (pos === stops.length - 1 && stops.length > 1) role = 'dest';
+    else if (pos > 0) role = 'inter';
     const m = L.marker([p.lat, p.lng], { icon: mkIcon(role) })
       .addTo(map)
       .bindTooltip(p.name, { direction: 'top', offset: [0, -10] });
@@ -830,6 +872,7 @@ function renderMarkers() {
 function drawOverviewLines() {
   lines.forEach(l => l.remove());
   lines = [];
+  const originIdx = stops[0] ?? null;
   if (originIdx === null || !matrix.durations.length) return;
 
   const ori = places[originIdx];
@@ -855,55 +898,38 @@ function drawOverviewLines() {
   });
 }
 
-// ── Draw actual route ────────────────────────────────────────────────────────
-function clearRoute() {
-  if (routeLayer) { routeLayer.remove(); routeLayer = null; }
-}
-
-async function drawRoute() {
-  clearRoute();
-  lines.forEach(l => l.remove());
-  lines = [];
-  if (originIdx === null || destIdx === null) return;
-
+// ── Draw a new leg ───────────────────────────────────────────────────────────
+async function drawNextLeg(fromIdx, toIdx) {
   setStatus('Fetching route…');
-  const r = await fetch(`/api/route?from_idx=${originIdx}&to_idx=${destIdx}`);
+  const r = await fetch(`/api/route?from_idx=${fromIdx}&to_idx=${toIdx}`);
   const data = await r.json();
-  if (data.error || !data.geometry) { setStatus('No route found'); return; }
-
-  // Glow layer (thick, dim) + route layer (thin, bright)
-  const coords = data.geometry.coordinates.map(([lng, lat]) => [lat, lng]);
-  const glow = L.polyline(coords, { color: '#f59e0b', weight: 10, opacity: 0.12 }).addTo(map);
-  const route = L.polyline(coords, { color: '#fbbf24', weight: 3.5, opacity: 0.9 }).addTo(map);
-
-  // Animate flow
-  const el = route.getElement();
-  if (el) {
-    el.style.strokeDasharray = '12 8';
-    el.style.animation = 'march 18s linear infinite';
+  if (data.error || !data.geometry) {
+    stops.pop();
+    renderMarkers();
+    setStatus('No route found');
+    return;
   }
 
-  // Wrap both in a layer group so we can remove together
-  routeLayer = L.layerGroup([glow, route]).addTo(map);
-  // layerGroup.addTo adds the group but layers are already added — remove the doubles
-  glow.remove(); route.remove();
-  glow.addTo(map); route.addTo(map);
-  routeLayer = { remove: () => { glow.remove(); route.remove(); } };
+  legData.push(data);
 
-  // Fit to route
-  map.fitBounds(L.latLngBounds(coords), { padding: [60, 80], animate: true });
+  const coords = data.geometry.coordinates.map(([lng, lat]) => [lat, lng]);
+  const glow  = L.polyline(coords, { color: '#f59e0b', weight: 10, opacity: 0.12 }).addTo(map);
+  const route = L.polyline(coords, { color: '#fbbf24', weight: 3.5, opacity: 0.9 }).addTo(map);
+  const el = route.getElement();
+  if (el) { el.style.strokeDasharray = '12 8'; el.style.animation = 'march 18s linear infinite'; }
+  routeLayers.push({ remove: () => { glow.remove(); route.remove(); } });
 
-  const mins  = Math.round(data.duration / 60);
-  const h = Math.floor(mins / 60), m = mins % 60;
-  const time  = h > 0 ? (m > 0 ? `${h}h ${m}m` : `${h}h`) : `${m}m`;
-  const km = (data.distance / 1000).toFixed(0);
+  // Fit map to entire trip so far
+  const allCoords = legData.flatMap(l => l.geometry.coordinates.map(([lng, lat]) => [lat, lng]));
+  map.fitBounds(L.latLngBounds(allCoords), { padding: [60, 80], animate: true });
 
-  renderSidebar(data);
-  setStatus(`${places[originIdx].name} → ${places[destIdx].name} · ${time} · ${km} km`);
+  renderSidebar();
+  const totalMins = Math.round(legData.reduce((s, l) => s + l.duration, 0) / 60);
+  setStatus(`${stops.length} stops · ${fmtTime(totalMins)} total — click to add another`);
 }
 
 // ── Render sidebar ──────────────────────────────────────────────────────────
-function renderSidebar(routeData = null) {
+function renderSidebar() {
   const list = document.getElementById('places-list');
 
   if (!places.length) {
@@ -915,54 +941,60 @@ function renderSidebar(routeData = null) {
     return;
   }
 
+  // Multi-stop route card
   let routeCard = '';
-  if (routeData && originIdx !== null && destIdx !== null) {
-    const mins  = Math.round(routeData.duration / 60);
-    const h = Math.floor(mins / 60), m = mins % 60;
-    const time  = h > 0 ? (m > 0 ? `${h}h ${m}m` : `${h}h`) : `${m}m`;
-    const km = (routeData.distance / 1000).toFixed(0);
-    routeCard = `
-      <div class="route-card">
-        <div class="route-endpoints">
-          <div class="route-ep origin-ep">
-            <span class="route-dot origin-dot"></span>
-            <span>${esc(places[originIdx].name)}</span>
-          </div>
-          <div class="route-line-divider"></div>
-          <div class="route-ep dest-ep">
-            <span class="route-dot dest-dot"></span>
-            <span>${esc(places[destIdx].name)}</span>
-          </div>
-        </div>
-        <div class="route-stats">
-          <span class="route-stat-main">🚗 ${time}</span>
-          <span class="route-stat-sub">${km} km by road</span>
-        </div>
-        <button class="clear-btn" onclick="reset()">✕ Clear route</button>
+  if (legData.length > 0) {
+    const totalDur  = legData.reduce((s, l) => s + l.duration, 0);
+    const totalDist = legData.reduce((s, l) => s + l.distance, 0);
+    let stopsHtml = '';
+    stops.forEach((idx, si) => {
+      const isFirst = si === 0;
+      const isLast  = si === stops.length - 1;
+      const dotCls  = isFirst ? 'origin-dot' : isLast ? 'dest-dot' : 'inter-dot';
+      stopsHtml += `<div class="route-stop">
+        <span class="route-dot ${dotCls}"></span>
+        <span>${esc(places[idx].name)}</span>
       </div>`;
+      if (si < legData.length) {
+        const l = legData[si];
+        stopsHtml += `<div class="route-leg-row">
+          <div class="leg-vert-line"></div>
+          <span class="leg-label">🚗 ${fmtTime(Math.round(l.duration / 60))} · ${(l.distance/1000).toFixed(0)} km</span>
+        </div>`;
+      }
+    });
+    routeCard = `<div class="route-card">
+      <div class="route-stops-list">${stopsHtml}</div>
+      <div class="route-total">Total: ${fmtTime(Math.round(totalDur/60))} · ${(totalDist/1000).toFixed(0)} km</div>
+      <button class="clear-btn" onclick="reset()">✕ Clear</button>
+    </div>`;
   }
 
-  const durRow = (originIdx !== null && matrix.durations.length)
-    ? (matrix.durations[originIdx] || []) : [];
+  // Drive times from last stop (or origin if no legs yet)
+  const lastIdx = stops.length ? stops[stops.length - 1] : null;
+  const durRow  = (lastIdx !== null && matrix.durations.length)
+    ? (matrix.durations[lastIdx] || []) : [];
 
   const ordered = places
     .map((p, i) => ({ ...p, idx: i }))
     .sort((a, b) => {
       if (a.geocode_failed && !b.geocode_failed) return 1;
       if (!a.geocode_failed && b.geocode_failed) return -1;
-      if (a.idx === originIdx) return -1;
-      if (b.idx === originIdx) return 1;
-      if (a.idx === destIdx) return -1;
-      if (b.idx === destIdx) return 1;
+      const aStop = stops.includes(a.idx), bStop = stops.includes(b.idx);
+      if (aStop && !bStop) return -1;
+      if (!aStop && bStop) return 1;
       if (!durRow.length) return 0;
       return (durRow[a.idx] ?? Infinity) - (durRow[b.idx] ?? Infinity);
     });
 
   let rank = 1;
   const cards = ordered.map(p => {
-    const i = p.idx;
-    const isOrigin = i === originIdx;
-    const isDest   = i === destIdx;
+    const i   = p.idx;
+    const pos = stops.indexOf(i);
+    const isOrigin = pos === 0;
+    const isLast   = pos === stops.length - 1 && stops.length > 1;
+    const isInter  = pos > 0 && !isLast;
+    const inRoute  = pos >= 0;
 
     if (p.geocode_failed) {
       return `<div class="place-card failed">
@@ -977,34 +1009,36 @@ function renderSidebar(routeData = null) {
     }
 
     const dur  = durRow[i];
-    const dist = (matrix.distances[originIdx] || [])[i];
+    const dist = (matrix.distances[lastIdx] || [])[i];
 
     let travelHtml;
-    if (isOrigin) {
+    if (isOrigin && stops.length === 1) {
       travelHtml = `<div class="place-travel"><span class="chip origin">📍 Origin</span></div>`;
-    } else if (isDest && routeData) {
-      travelHtml = `<div class="place-travel"><span class="chip dest-chip">🏁 Destination</span></div>`;
-    } else if (dur != null && originIdx !== null) {
-      const mins = Math.round(dur / 60);
-      const h = Math.floor(mins / 60), m = mins % 60;
-      const t = h > 0 ? (m > 0 ? `${h}h ${m}m` : `${h}h`) : `${m}m`;
+    } else if (isOrigin) {
+      travelHtml = `<div class="place-travel"><span class="chip origin">📍 Start</span></div>`;
+    } else if (isLast) {
+      travelHtml = `<div class="place-travel"><span class="chip dest-chip">🏁 Last stop</span></div>`;
+    } else if (isInter) {
+      travelHtml = `<div class="place-travel"><span class="chip inter-chip">📌 Stop ${pos}</span></div>`;
+    } else if (dur != null && lastIdx !== null) {
       const km = dist ? `${(dist / 1000).toFixed(0)} km` : '';
       travelHtml = `<div class="place-travel">
-        <span class="chip drive">🚗 ${t}</span>
+        <span class="chip drive">🚗 ${fmtTime(Math.round(dur / 60))}</span>
         ${km ? `<span class="dist-label">${km}</span>` : ''}
       </div>`;
-    } else if (originIdx !== null && dur == null) {
+    } else if (lastIdx !== null && dur == null) {
       travelHtml = `<div class="place-travel"><span class="chip na">No route</span></div>`;
     } else {
       travelHtml = `<div class="place-travel"><span style="font-size:11px;color:var(--text-lo)">Select to view</span></div>`;
     }
 
-    const rankHtml = (!isOrigin && !isDest && originIdx !== null && durRow.length && dur != null)
+    const rankHtml = (!inRoute && lastIdx !== null && durRow.length && dur != null)
       ? `<span class="rank-badge">#${rank++}</span>` : '';
 
-    const activeClass = isOrigin ? ' active' : isDest ? ' active dest-active' : '';
+    const activeClass = isOrigin ? ' active' : isLast ? ' active dest-active' : isInter ? ' active inter-active' : '';
+    const barClass    = isLast ? ' dest-bar' : isInter ? ' inter-bar' : '';
     return `<div class="place-card${activeClass}" onclick="pick(${i})">
-      <div class="card-bar${isDest ? ' dest-bar' : ''}"></div>
+      <div class="card-bar${barClass}"></div>
       <div class="card-top">
         <div class="place-name">${esc(p.name)}</div>
         ${rankHtml}
@@ -1022,33 +1056,26 @@ function renderSidebar(routeData = null) {
 function pick(idx) {
   if (places[idx]?.geocode_failed) return;
 
-  if (destIdx !== null) {
-    // Route active → any click resets
-    reset();
-  } else if (originIdx === null) {
-    // Nothing selected → set origin
-    originIdx = idx;
+  if (stops.length === 0) {
+    stops = [idx];
     renderMarkers();
     renderSidebar();
     drawOverviewLines();
-    setStatus(`Driving times from ${places[idx].name} — click another to route`);
-  } else if (idx === originIdx) {
-    // Click origin again → full reset
-    reset();
-  } else {
-    // Different place → set as destination, show route
-    destIdx = idx;
-    renderMarkers();
-    drawRoute();
+    setStatus(`Starting from ${places[idx].name} — click another to add a stop`);
+    return;
   }
+
+  // Always append — revisiting a stop is allowed (e.g. round trips)
+  const fromIdx = stops[stops.length - 1];
+  stops.push(idx);
+  lines.forEach(l => l.remove()); lines = [];
+  renderMarkers();
+  drawNextLeg(fromIdx, idx);
 }
 
 function reset() {
-  originIdx = null;
-  destIdx   = null;
-  clearRoute();
-  lines.forEach(l => l.remove());
-  lines = [];
+  stops = []; routeLayers.forEach(l => l.remove()); routeLayers = []; legData = [];
+  lines.forEach(l => l.remove()); lines = [];
   renderMarkers();
   renderSidebar();
   setStatus('Click a location to start');
@@ -1059,6 +1086,11 @@ const esc = s => String(s)
   .replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
 
 const setStatus = t => document.getElementById('status-text').textContent = t;
+
+function fmtTime(mins) {
+  const h = Math.floor(mins / 60), m = mins % 60;
+  return h > 0 ? (m > 0 ? `${h}h ${m}m` : `${h}h`) : `${m}m`;
+}
 
 // ── Init ────────────────────────────────────────────────────────────────────
 async function init() {
